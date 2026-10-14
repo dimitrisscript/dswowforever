@@ -1,0 +1,14 @@
+package-as: DSWowForever
+
+ignore:
+  - docs/
+  - spec/
+  - Tests/
+  - .github/
+  - .vscode/
+
+# No externals for the starter. Add Libs here when needed, e.g.:
+# externals:
+#   Libs/LibStub:
+#     url: https://repos.curseforge.com/wow/libstub/trunk
+#     tag: latest

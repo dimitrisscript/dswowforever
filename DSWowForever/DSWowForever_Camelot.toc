@@ -1,0 +1,12 @@
+## Interface: 16001
+## Title: DS Wow Forever
+## Notes: Minimal Forever-ready starter. Safe on 1.60.1 beta (no combat log, secret-guarded).
+## Author: dswowforever
+## Version: 0.1.0
+## SavedVariables: DSWowForeverDB
+## IconTexture: Interface\Icons\INV_Misc_QuestionMark
+## X-Category: Miscellaneous
+## AllowLoadGameType: camelot
+## ExcludeLoadGameType: standard, classic
+
+Core.lua

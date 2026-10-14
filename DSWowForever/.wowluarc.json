@@ -1,0 +1,4 @@
+{
+  "flavors": ["mainline"],
+  "ignore": ["Libs/"]
+}
