@@ -85,8 +85,8 @@ end
 
 -- XP bar ---------------------------------------------------------------
 -- When enabled, the default experience bar and all its visual frame/ticks
--- are completely hidden, and a clean text label showing e.g. "XP: 33%"
--- is displayed in its place.
+-- are completely hidden, and a clean text label showing e.g. "XP: 33%" plus
+-- the available rested XP is displayed in its place.
 local xpTextFrame = nil
 
 local function GetXPPercent()
@@ -110,6 +110,23 @@ local function GetXPPercent()
     return 100
   end
   return percent
+end
+
+local function GetRestedXPPercent()
+  if type(GetXPExhaustion) ~= "function" or type(UnitXPMax) ~= "function" then
+    return nil
+  end
+
+  local rested = GetXPExhaustion()
+  local maximum = UnitXPMax("player")
+  if IsSecret(rested) or IsSecret(maximum) then
+    return nil
+  end
+  if type(rested) ~= "number" or type(maximum) ~= "number" or maximum <= 0 or rested <= 0 then
+    return nil
+  end
+
+  return rested / maximum * 100
 end
 
 local function SetXPFrameClamped(frame, unclamped)
@@ -308,7 +325,11 @@ function ns.UpdateXPPercent()
 
   local showPercent = ns.db.showXPPercent == true
   local percent = showPercent and GetXPPercent() or nil
+  local restedPercent = showPercent and GetRestedXPPercent() or nil
   local label = percent and string.format("XP: %.2f%%", percent) or nil
+  if label and restedPercent then
+    label = label .. string.format("\n|cff6cb6ffRested: %.2f%%|r", restedPercent)
+  end
 
   SetXPBarVisualHidden(showPercent)
 
@@ -317,10 +338,13 @@ function ns.UpdateXPPercent()
     UpdateXPTextFramePosition(ff)
     ff.text:SetText(label)
 
-    -- Keep the drag area the same width as the label.
+    -- Keep the drag area the same size as the label.
     local width = ff.text:GetStringWidth()
-    if type(width) == "number" and not IsSecret(width) and width > 0 then
-      ff:SetSize(width + 8, 20)
+    local height = ff.text:GetStringHeight()
+    if type(width) == "number" and type(height) == "number"
+      and not IsSecret(width) and not IsSecret(height)
+      and width > 0 and height > 0 then
+      ff:SetSize(width + 8, height + 4)
     end
 
     ff:Show()
@@ -391,7 +415,7 @@ local function CreateOptions()
     "Hides the micro menu buttons (Character, Spellbook, Professions, etc.).")
   AddCheckbox(category, "DSWF_XP_PERCENT", "showXPPercent",
     "Replace XP bar with percentage",
-    "Hides the XP bar and shows your current level progress as a percentage.",
+    "Hides the XP bar and shows your current level progress and rested XP as percentages.",
     true)
 
   Settings.RegisterAddOnCategory(category)
@@ -447,6 +471,10 @@ function frame:UPDATE_EXHAUSTION()
   ns.UpdateXPPercent()
 end
 
+function frame:PLAYER_UPDATE_RESTING()
+  ns.UpdateXPPercent()
+end
+
 function frame:PLAYER_LEVEL_UP()
   ns.UpdateXPPercent()
 end
@@ -481,6 +509,7 @@ frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_XP_UPDATE")
 frame:RegisterEvent("UPDATE_EXHAUSTION")
+frame:RegisterEvent("PLAYER_UPDATE_RESTING")
 frame:RegisterEvent("PLAYER_LEVEL_UP")
 frame:RegisterEvent("ENABLE_XP_GAIN")
 frame:RegisterEvent("DISABLE_XP_GAIN")
