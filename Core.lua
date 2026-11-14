@@ -281,15 +281,16 @@ local function GetOrCreateXPTextFrame()
   f:SetScript("OnDragStop", function(self)
     self:StopMovingOrSizing()
 
-    -- Save the visual centre rather than whichever corner StopMovingOrSizing
-    -- leaves the frame anchored to, so resizing cannot make the text drift.
-    local centerX, centerY = self:GetCenter()
-    if type(centerX) == "number" and type(centerY) == "number"
-      and not IsSecret(centerX) and not IsSecret(centerY) then
+    -- Pin the left edge and keep the vertical centre. This way the XP prefix
+    -- stays put and the rested suffix grows/shrinks to its right.
+    local left = self:GetLeft()
+    local _, centerY = self:GetCenter()
+    if type(left) == "number" and type(centerY) == "number"
+      and not IsSecret(left) and not IsSecret(centerY) then
       self:ClearAllPoints()
-      self:SetPoint("CENTER", UIParent, "BOTTOMLEFT", centerX, centerY)
+      self:SetPoint("LEFT", UIParent, "BOTTOMLEFT", left, centerY)
       if ns.db then
-        ns.db.xpTextPos = { point = "CENTER", relPoint = "BOTTOMLEFT", x = centerX, y = centerY }
+        ns.db.xpTextPos = { point = "LEFT", relPoint = "BOTTOMLEFT", x = left, y = centerY }
       end
     elseif ns.db then
       local point, _, relPoint, x, y = self:GetPoint()
@@ -307,38 +308,49 @@ local function UpdateXPTextFramePosition(f)
     return
   end
 
-  -- Restore saved position if the user has dragged it before
+  -- Restore a dragged position. The saved x is the left edge, so the label
+  -- still grows/shrinks to the right when the rested part changes.
   if ns.db and ns.db.xpTextPos then
     local p = ns.db.xpTextPos
-    local point = p.point or "CENTER"
-    local relPoint = p.relPoint or "CENTER"
+    local point = p.point or "LEFT"
+    local relPoint = p.relPoint or "BOTTOMLEFT"
     f:ClearAllPoints()
     f:SetPoint(point, UIParent, relPoint, p.x or 0, p.y or 0)
 
-    -- Older saves used a corner anchor. Convert them to a centre anchor so
-    -- the frame can resize without the text sliding sideways.
-    if point ~= "CENTER" or relPoint ~= "BOTTOMLEFT" then
-      local centerX, centerY = f:GetCenter()
-      if type(centerX) == "number" and type(centerY) == "number"
-        and not IsSecret(centerX) and not IsSecret(centerY) then
+    -- Migrate older centre/corner saves to a left-edge anchor.
+    if point ~= "LEFT" then
+      local left = f:GetLeft()
+      local _, centerY = f:GetCenter()
+      if type(left) == "number" and type(centerY) == "number"
+        and not IsSecret(left) and not IsSecret(centerY) then
         f:ClearAllPoints()
-        f:SetPoint("CENTER", UIParent, "BOTTOMLEFT", centerX, centerY)
-        ns.db.xpTextPos = { point = "CENTER", relPoint = "BOTTOMLEFT", x = centerX, y = centerY }
+        f:SetPoint("LEFT", UIParent, "BOTTOMLEFT", left, centerY)
+        ns.db.xpTextPos = { point = "LEFT", relPoint = "BOTTOMLEFT", x = left, y = centerY }
       end
     end
     return
   end
 
-  -- Default: centre over the status-bar container (where the XP bar used to be)
-  f:ClearAllPoints()
+  -- Default: keep the left edge pinned near the centre of the status bar.
+  -- The offset is chosen on first layout so the initial label is centred, then
+  -- stays fixed while the label width changes.
   local anchor = _G.MainStatusTrackingBarContainer
     or _G.StatusTrackingBarManager
     or _G.MainMenuExpBar
 
-  if anchor and anchor:GetCenter() then
-    f:SetPoint("CENTER", anchor, "CENTER", 0, 0)
+  if anchor then
+    if f.DSWFXPLeftOffset == nil then
+      local width = f:GetWidth()
+      if type(width) ~= "number" or IsSecret(width) or width <= 0 then
+        width = 100
+      end
+      f.DSWFXPLeftOffset = -width / 2
+    end
+    f:ClearAllPoints()
+    f:SetPoint("LEFT", anchor, "CENTER", f.DSWFXPLeftOffset, 0)
   else
-    f:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, 8)
+    f:ClearAllPoints()
+    f:SetPoint("LEFT", UIParent, "BOTTOMLEFT", 8, 8)
   end
 end
 
@@ -359,7 +371,6 @@ function ns.UpdateXPPercent()
 
   local ff = GetOrCreateXPTextFrame()
   if label then
-    UpdateXPTextFramePosition(ff)
     ff.text:SetText(label)
 
     -- Keep the drag area the same size as the label.
@@ -371,6 +382,7 @@ function ns.UpdateXPPercent()
       ff:SetSize(width + 8, height + 4)
     end
 
+    UpdateXPTextFramePosition(ff)
     ff:Show()
   else
     ff:Hide()
