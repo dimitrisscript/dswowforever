@@ -328,7 +328,7 @@ function ns.UpdateXPPercent()
   local restedPercent = showPercent and GetRestedXPPercent() or nil
   local label = percent and string.format("XP: %.2f%%", percent) or nil
   if label and restedPercent then
-    label = label .. string.format("\n|cff6cb6ffRested: %.2f%%|r", restedPercent)
+    label = string.format("XP: %.2f%%-%.2f%% Rested", percent, restedPercent)
   end
 
   SetXPBarVisualHidden(showPercent)
