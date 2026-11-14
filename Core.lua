@@ -280,9 +280,19 @@ local function GetOrCreateXPTextFrame()
   end)
   f:SetScript("OnDragStop", function(self)
     self:StopMovingOrSizing()
-    -- Save position relative to UIParent so it survives reloads
-    local point, _, relPoint, x, y = self:GetPoint()
-    if ns.db then
+
+    -- Save the visual centre rather than whichever corner StopMovingOrSizing
+    -- leaves the frame anchored to, so resizing cannot make the text drift.
+    local centerX, centerY = self:GetCenter()
+    if type(centerX) == "number" and type(centerY) == "number"
+      and not IsSecret(centerX) and not IsSecret(centerY) then
+      self:ClearAllPoints()
+      self:SetPoint("CENTER", UIParent, "BOTTOMLEFT", centerX, centerY)
+      if ns.db then
+        ns.db.xpTextPos = { point = "CENTER", relPoint = "BOTTOMLEFT", x = centerX, y = centerY }
+      end
+    elseif ns.db then
+      local point, _, relPoint, x, y = self:GetPoint()
       ns.db.xpTextPos = { point = point, relPoint = relPoint, x = x, y = y }
     end
   end)
@@ -300,8 +310,22 @@ local function UpdateXPTextFramePosition(f)
   -- Restore saved position if the user has dragged it before
   if ns.db and ns.db.xpTextPos then
     local p = ns.db.xpTextPos
+    local point = p.point or "CENTER"
+    local relPoint = p.relPoint or "CENTER"
     f:ClearAllPoints()
-    f:SetPoint(p.point or "CENTER", UIParent, p.relPoint or "CENTER", p.x or 0, p.y or 0)
+    f:SetPoint(point, UIParent, relPoint, p.x or 0, p.y or 0)
+
+    -- Older saves used a corner anchor. Convert them to a centre anchor so
+    -- the frame can resize without the text sliding sideways.
+    if point ~= "CENTER" or relPoint ~= "BOTTOMLEFT" then
+      local centerX, centerY = f:GetCenter()
+      if type(centerX) == "number" and type(centerY) == "number"
+        and not IsSecret(centerX) and not IsSecret(centerY) then
+        f:ClearAllPoints()
+        f:SetPoint("CENTER", UIParent, "BOTTOMLEFT", centerX, centerY)
+        ns.db.xpTextPos = { point = "CENTER", relPoint = "BOTTOMLEFT", x = centerX, y = centerY }
+      end
+    end
     return
   end
 
