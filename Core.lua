@@ -103,7 +103,7 @@ local function GetXPPercent()
     return nil
   end
 
-  local percent = math.floor(current / maximum * 100)
+  local percent = current / maximum * 100
   if percent < 0 then
     return 0
   elseif percent > 100 then
@@ -308,7 +308,7 @@ function ns.UpdateXPPercent()
 
   local showPercent = ns.db.showXPPercent == true
   local percent = showPercent and GetXPPercent() or nil
-  local label = percent and ("XP: " .. tostring(percent) .. "%") or nil
+  local label = percent and string.format("XP: %.2f%%", percent) or nil
 
   SetXPBarVisualHidden(showPercent)
 
@@ -316,6 +316,13 @@ function ns.UpdateXPPercent()
   if label then
     UpdateXPTextFramePosition(ff)
     ff.text:SetText(label)
+
+    -- Keep the drag area the same width as the label.
+    local width = ff.text:GetStringWidth()
+    if type(width) == "number" and not IsSecret(width) and width > 0 then
+      ff:SetSize(width + 8, 20)
+    end
+
     ff:Show()
   else
     ff:Hide()
