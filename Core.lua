@@ -62,6 +62,9 @@ local function InitDB()
   if type(db.trackThornsOnTank) ~= "boolean" then
     db.trackThornsOnTank = false
   end
+  if type(db.thornsButtonLocked) ~= "boolean" then
+    db.thornsButtonLocked = true
+  end
   if type(db.stunLog) ~= "table" then
     db.stunLog = {}
   end
@@ -303,7 +306,10 @@ local function GetOrCreateXPTextFrame()
   f:SetSize(80, 20)
 
   local text = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  text:SetPoint("CENTER", f, "CENTER", 0, 0)
+  -- Anchor the text by its left edge so the label always grows to the right
+  -- and stays flush with the left side of the bar as the numbers change.
+  text:SetPoint("LEFT", f, "LEFT", 0, 0)
+  text:SetJustifyH("LEFT")
   text:SetTextColor(1, 1, 1) -- crisp white
   text:SetShadowOffset(1, -1)
   text:SetShadowColor(0, 0, 0, 1)
@@ -365,23 +371,16 @@ local function UpdateXPTextFramePosition(f)
     return
   end
 
-  -- Default: keep the left edge pinned near the centre of the status bar.
-  -- The offset is chosen on first layout so the initial label is centred, then
-  -- stays fixed while the label width changes.
+  -- Default: pin the label's left edge flush with the left edge of the bar,
+  -- so the text reads left-to-right from the start of the bar instead of
+  -- being centred over it.
   local anchor = _G.MainStatusTrackingBarContainer
     or _G.StatusTrackingBarManager
     or _G.MainMenuExpBar
 
   if anchor then
-    if f.DSWFXPLeftOffset == nil then
-      local width = f:GetWidth()
-      if type(width) ~= "number" or IsSecret(width) or width <= 0 then
-        width = 100
-      end
-      f.DSWFXPLeftOffset = -width / 2
-    end
     f:ClearAllPoints()
-    f:SetPoint("LEFT", anchor, "CENTER", f.DSWFXPLeftOffset, 0)
+    f:SetPoint("LEFT", anchor, "LEFT", 0, 0)
   else
     f:ClearAllPoints()
     f:SetPoint("LEFT", UIParent, "BOTTOMLEFT", 8, 8)
@@ -1029,6 +1028,12 @@ local THORNS_ICON = "Interface\\Icons\\Spell_Nature_Thorns"
 
 local thornsButton = nil
 
+-- The thorns button starts locked so it cannot be dragged by accident. The
+-- lock/unlock control in options flips this saved value.
+local function IsThornsButtonLocked()
+  return not ns.db or ns.db.thornsButtonLocked ~= false
+end
+
 local function IsDruid()
   if type(UnitClass) ~= "function" then
     return false
@@ -1198,6 +1203,10 @@ local function GetOrCreateThornsButton()
   btn:SetSize(36, 36)
   btn:SetFrameStrata("HIGH")
   btn:SetClampedToScreen(true)
+  -- StartMoving() is a no-op unless the frame is movable. Dragging is gated by
+  -- the lock in OnDragStart, so it stays put while locked.
+  btn:SetMovable(true)
+  btn:EnableMouse(true)
   btn:RegisterForClicks("AnyUp")
   btn:RegisterForDrag("LeftButton")
 
@@ -1211,16 +1220,36 @@ local function GetOrCreateThornsButton()
   highlight:SetTexture("Interface\\Buttons\\ButtonHilight-Square")
   highlight:SetBlendMode("ADD")
 
+  -- Gold border shown while unlocked, so the positioning handle is obvious.
+  local moveHint = btn:CreateTexture(nil, "OVERLAY")
+  moveHint:SetAllPoints(btn)
+  moveHint:SetTexture("Interface\\Buttons\\ButtonHilight-Square")
+  moveHint:SetBlendMode("ADD")
+  moveHint:SetVertexColor(1, 0.82, 0)
+  moveHint:Hide()
+  btn.moveHint = moveHint
+
   btn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:AddLine(THORNS_SPELL_NAME)
-    local tankName = self.DSWF_TankName
-    if tankName then
-      GameTooltip:AddLine("Click to cast Thorns on " .. tankName .. ".", 1, 1, 1, true)
+    if self.DSWF_Movable then
+      GameTooltip:AddLine("Placement mode: drag the button to move it.", 1, 0.82, 0, true)
+      GameTooltip:AddLine("Click \"Unlocked\" in options to lock it again.", 0.7, 0.7, 0.7, true)
     else
-      GameTooltip:AddLine("Click to cast Thorns on the tank.", 1, 1, 1, true)
+      local tankName = self.DSWF_TankName
+      if tankName then
+        GameTooltip:AddLine("Click to cast Thorns on " .. tankName .. ".", 1, 1, 1, true)
+      else
+        GameTooltip:AddLine("Click to cast Thorns on the tank.", 1, 1, 1, true)
+      end
+      GameTooltip:AddLine("Out of combat only.", 0.7, 0.7, 0.7, true)
     end
-    GameTooltip:AddLine("Out of combat only. Drag to move.", 0.7, 0.7, 0.7, true)
+
+    if IsThornsButtonLocked() then
+      GameTooltip:AddLine("Locked. Unlock it in Options > Druid to drag.", 0.7, 0.7, 0.7, true)
+    else
+      GameTooltip:AddLine("Unlocked. Drag to move, then lock it again.", 0.7, 0.7, 0.7, true)
+    end
     GameTooltip:Show()
   end)
 
@@ -1229,14 +1258,23 @@ local function GetOrCreateThornsButton()
   end)
 
   btn:SetScript("OnDragStart", function(self)
-    if not InCombatLockdown() then
+    if InCombatLockdown() then
+      print("[" .. addonName .. "] Cannot move the thorns button while in combat.")
+    elseif IsThornsButtonLocked() then
+      print("[" .. addonName .. "] Thorns button is locked. Unlock it in Options > Druid.")
+    else
+      -- Belt and braces: buttons created before the movable fix still drag.
+      self:SetMovable(true)
+      self:EnableMouse(true)
       self:StartMoving()
     end
   end)
 
   btn:SetScript("OnDragStop", function(self)
     self:StopMovingOrSizing()
-    SaveThornsButtonPosition(self)
+    if not IsThornsButtonLocked() then
+      SaveThornsButtonPosition(self)
+    end
   end)
 
   ApplyThornsButtonPosition(btn)
@@ -1249,7 +1287,46 @@ function ns.UpdateThornsIcon()
   local btn = thornsButton
   local enabled = ns.db and ns.db.trackThornsOnTank == true
 
-  if not enabled or not IsDruid() or not IsInDungeon() or InCombatLockdown() then
+  if not enabled then
+    if btn then
+      btn:Hide()
+    end
+    ns.thornsTank = nil
+    return
+  end
+
+  -- Unlocked is a placement mode: keep the button visible as a positioning
+  -- handle even when there is no tank to buff. It does not cast in this mode.
+  if not IsThornsButtonLocked() then
+    if InCombatLockdown() then
+      if btn then
+        btn:Hide()
+      end
+      ns.thornsTank = nil
+      return
+    end
+
+    btn = GetOrCreateThornsButton()
+    if not btn then
+      ns.thornsTank = nil
+      return
+    end
+
+    ns.thornsTank = nil
+    btn.DSWF_TankName = nil
+    btn.DSWF_Movable = true
+    btn:SetAttribute("type", nil)
+    btn:SetAttribute("spell", nil)
+    btn:SetAttribute("unit", nil)
+    btn:SetAlpha(1)
+    if btn.moveHint then
+      btn.moveHint:Show()
+    end
+    btn:Show()
+    return
+  end
+
+  if not IsDruid() or not IsInDungeon() or InCombatLockdown() then
     if btn then
       btn:Hide()
     end
@@ -1261,6 +1338,12 @@ function ns.UpdateThornsIcon()
   if not btn then
     ns.thornsTank = nil
     return
+  end
+
+  btn.DSWF_Movable = false
+  btn:SetAlpha(1)
+  if btn.moveHint then
+    btn.moveHint:Hide()
   end
 
   local tank = GetDungeonTank()
@@ -1401,6 +1484,77 @@ local function AddStunCheckboxWithLock(category)
   end
 end
 
+-- Same combined-row treatment for the thorns option: a Locked/Unlocked button
+-- next to the checkbox when the client supports it, otherwise two checkboxes.
+local function AddThornsCheckboxWithLock(category)
+  local variable = "DSWF_TRACK_THORNS_ON_TANK"
+  local label = "Track thorns on tank"
+  local tooltip = "When playing a druid in a dungeon, shows a Thorns icon while the "
+    .. "tank is missing Thorns. Click the icon to buff the tank. Only shown out "
+    .. "of combat. Use the Locked/Unlocked button to move the icon."
+  local setting = Settings.RegisterProxySetting(
+    category,
+    variable,
+    Settings.VarType.Boolean,
+    label,
+    false,
+    function()
+      return ns.db.trackThornsOnTank == true
+    end,
+    function(value)
+      ns.db.trackThornsOnTank = value == true
+      ns.ApplyOptions()
+    end
+  )
+
+  local combined = false
+  if type(CreateSettingsCheckboxWithButtonInitializer) == "function"
+    and type(Settings.RegisterInitializer) == "function" then
+    local function LockButtonText()
+      return IsThornsButtonLocked() and "Locked" or "Unlocked"
+    end
+
+    local function OnLockButtonClick()
+      if not ns.db then
+        return
+      end
+      ns.db.thornsButtonLocked = not IsThornsButtonLocked()
+      ns.UpdateThornsIcon()
+      pcall(Settings.NotifyUpdate, variable)
+    end
+
+    local function EvaluateLockButton(control)
+      if not control or not control.Button then
+        return
+      end
+      control.Button.tooltipText = IsThornsButtonLocked()
+        and "Thorns button is locked. Click to unlock and allow dragging."
+        or "Thorns button is unlocked. Drag it to move, then click to lock."
+    end
+
+    local created, initializer = pcall(
+      CreateSettingsCheckboxWithButtonInitializer,
+      setting,
+      LockButtonText,
+      OnLockButtonClick,
+      EvaluateLockButton,
+      false,
+      tooltip
+    )
+    if created and initializer then
+      combined = pcall(Settings.RegisterInitializer, category, initializer)
+    end
+  end
+
+  if not combined then
+    Settings.CreateCheckbox(category, setting, tooltip)
+    AddCheckbox(category, "DSWF_THORNS_LOCK", "thornsButtonLocked",
+      "Lock thorns button position",
+      "Checked: the Thorns button cannot be dragged. Uncheck it to show the button for positioning, drag it, then check it again to lock.",
+      true)
+  end
+end
+
 local function CreateOptions()
   if ns.optionsCategory or type(Settings) ~= "table" then
     return
@@ -1438,9 +1592,7 @@ local function CreateOptions()
     end
   end
 
-  AddCheckbox(druidCategory, "DSWF_TRACK_THORNS_ON_TANK", "trackThornsOnTank",
-    "Track thorns on tank",
-    "When playing a druid in a dungeon, shows a Thorns icon while the tank is missing Thorns. Click the icon to buff the tank. Only shown out of combat.")
+  AddThornsCheckboxWithLock(druidCategory)
 
   Settings.RegisterAddOnCategory(category)
 end
@@ -1727,6 +1879,7 @@ SlashCmdList["DSWOWFOREVER"] = function(msg)
       .. " announceStun=" .. tostring(ns.db and ns.db.announceStun)
       .. " stunButtonLocked=" .. tostring(ns.db and ns.db.stunButtonLocked)
       .. " trackThornsOnTank=" .. tostring(ns.db and ns.db.trackThornsOnTank)
+      .. " thornsButtonLocked=" .. tostring(ns.db and ns.db.thornsButtonLocked)
       .. " xpPercent=" .. tostring(GetXPPercent()))
     Refresh()
   elseif msg == "stun" then
@@ -1751,7 +1904,13 @@ SlashCmdList["DSWOWFOREVER"] = function(msg)
       ns.db.stunLog = {}
     end
     print("[" .. addonName .. "] stun log cleared")
+  elseif msg == "thorns lock" then
+    if ns.db then
+      ns.db.thornsButtonLocked = not IsThornsButtonLocked()
+      ns.UpdateThornsIcon()
+      print("[" .. addonName .. "] thorns button " .. (IsThornsButtonLocked() and "locked" or "unlocked"))
+    end
   else
-    print("[" .. addonName .. "] usage: /ds (opens options), /ds status, /ds stun, /ds stun test, /ds stun button, /ds stun lock, /ds stun debug, /ds stun clear")
+    print("[" .. addonName .. "] usage: /ds (opens options), /ds status, /ds stun, /ds stun test, /ds stun button, /ds stun lock, /ds stun debug, /ds stun clear, /ds thorns lock")
   end
 end
