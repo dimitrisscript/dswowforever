@@ -56,8 +56,17 @@ local function InitDB()
   if type(db.announceStun) ~= "boolean" then
     db.announceStun = false
   end
+  if type(db.stunButtonLocked) ~= "boolean" then
+    db.stunButtonLocked = true
+  end
   if type(db.trackThornsOnTank) ~= "boolean" then
     db.trackThornsOnTank = false
+  end
+  if type(db.stunLog) ~= "table" then
+    db.stunLog = {}
+  end
+  if type(db.auraLog) ~= "table" then
+    db.auraLog = {}
   end
   ns.db = db
 end
@@ -415,11 +424,14 @@ function ns.UpdateXPPercent()
 end
 
 -- Stun announcer -------------------------------------------------------
--- When enabled, says "Stunned (Xs)" in /say whenever a stun is applied to
--- the player, where X is the remaining stun duration in seconds.
--- The loss-of-control API is used instead of aura scanning: aura contents can
--- be secret in combat, while the player's own loss-of-control data is readable.
+-- When enabled, says "Stunned (Xs)" in /say automatically inside instances,
+-- where SAY does not require a hardware event. Outdoors it queues the text
+-- and shows a click-to-say button, because Forever/Midnight require a
+-- hardware event for SAY there. X is the remaining stun duration in seconds.
+-- The loss-of-control API is used when readable; during combat its data can
+-- be secret, in which case control-lost events provide a generic message.
 local STUN_LOC_TYPE = "STUN"
+local STUN_ICON = "Interface\\Icons\\Ability_Rogue_KidneyShot"
 local stunLastKey = nil
 local stunDebug = false
 local stunEventsOk = nil
@@ -538,41 +550,413 @@ local function FormatStunSeconds(seconds)
   return (text:gsub("%.0$", ""))
 end
 
-local function SayStun(seconds)
-  local text = FormatStunSeconds(seconds)
-  local message = text and string.format("Stunned (%ss)", text) or "Stunned"
-
-  local send = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
-  if type(send) == "function" then
-    pcall(send, message, "SAY")
-  end
-end
-
 local function StunDebug(text)
   if stunDebug then
     print("[" .. addonName .. "] stun debug: " .. text)
   end
 end
 
--- Announces at most one message per stun. Any of the events below can call
--- this, so a client that does not fire one of them still announces via another.
-local function TryAnnounceStun()
+-- Keeps the last few stun events in the saved variables so a failed run can be
+-- inspected afterwards with /ds stun (written to disk on /reload or logout).
+local function StunTrace(text)
+  if not ns.db then
+    return
+  end
+  local log = ns.db.stunLog
+  if type(log) ~= "table" then
+    log = {}
+    ns.db.stunLog = log
+  end
+  log[#log + 1] = SafeText(GetTime()) .. "s " .. text
+  while #log > 25 do
+    table.remove(log, 1)
+  end
+  StunDebug(text)
+end
+
+local function BuildStunMessage(seconds)
+  local text = FormatStunSeconds(seconds)
+  if text then
+    return string.format("Stunned (%ss)", text)
+  end
+  return "Stunned"
+end
+
+local function SendSay(message)
+  local send = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
+  if type(send) ~= "function" then
+    return false, "SendChatMessage unavailable"
+  end
+  return pcall(send, message, "SAY")
+end
+
+local function SayStun(seconds)
+  return SendSay(BuildStunMessage(seconds))
+end
+
+-- Click-to-say button --------------------------------------------------
+-- A stun is detected from an event, not from a hardware event, so SAY is
+-- blocked outdoors. Queue the text and let the player click to send it.
+local stunPendingMessage = nil
+local stunPendingUntil = 0
+local STUN_BUTTON_TIMEOUT = 15
+local stunButton = nil
+local UpdateStunButton
+
+-- The stun button starts locked so it cannot be dragged by accident. The
+-- lock/unlock control in options flips this saved value.
+local function IsStunButtonLocked()
+  return not ns.db or ns.db.stunButtonLocked ~= false
+end
+
+local function ApplyStunButtonPosition(btn)
+  local pos = ns.db and ns.db.stunButtonPos
+  if type(pos) == "table" and type(pos.x) == "number" and type(pos.y) == "number" then
+    btn:ClearAllPoints()
+    btn:SetPoint(pos.point or "CENTER", UIParent, pos.relPoint or pos.point or "CENTER", pos.x, pos.y)
+    return
+  end
+  btn:ClearAllPoints()
+  btn:SetPoint("CENTER", UIParent, "CENTER", 0, 160)
+end
+
+local function SaveStunButtonPosition(btn)
+  if not ns.db then
+    return
+  end
+  local point, _, relPoint, x, y = btn:GetPoint()
+  if type(point) ~= "string" or type(x) ~= "number" or type(y) ~= "number"
+    or IsSecret(x) or IsSecret(y) then
+    return
+  end
+  ns.db.stunButtonPos = { point = point, relPoint = relPoint or point, x = x, y = y }
+end
+
+local function GetOrCreateStunButton()
+  if stunButton then
+    return stunButton
+  end
+  if InCombatLockdown() then
+    return nil
+  end
+
+  local ok, btn = pcall(CreateFrame, "Button", "DSWF_StunSayButton", UIParent)
+  if not ok or not btn then
+    return nil
+  end
+
+  btn:SetSize(64, 64)
+  btn:SetFrameStrata("HIGH")
+  btn:SetClampedToScreen(true)
+  btn:SetMovable(true)
+  btn:EnableMouse(true)
+  btn:RegisterForClicks("AnyUp")
+  btn:RegisterForDrag("LeftButton")
+
+  local bg = btn:CreateTexture(nil, "BACKGROUND")
+  bg:SetAllPoints(btn)
+  bg:SetTexture(STUN_ICON)
+
+  local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+  highlight:SetAllPoints(btn)
+  highlight:SetColorTexture(1, 1, 1, 0.25)
+
+  -- Label sits just under the square icon so it does not cover the artwork.
+  local text = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  text:SetPoint("TOP", btn, "BOTTOM", 0, -2)
+  text:SetTextColor(1, 1, 1)
+  text:SetShadowOffset(1, -1)
+  text:SetShadowColor(0, 0, 0, 1)
+  btn.DSWF_Text = text
+
+  btn:SetScript("OnClick", function(self)
+    if not stunPendingMessage then
+      return
+    end
+    local message = stunPendingMessage
+    local sent, err = SendSay(message)
+    StunTrace("button click ok=" .. SafeText(sent) .. " err=" .. SafeText(err)
+      .. " msg=" .. SafeText(message))
+    stunPendingMessage = nil
+    stunPendingUntil = 0
+    UpdateStunButton()
+  end)
+
+  btn:SetScript("OnDragStart", function(self)
+    if InCombatLockdown() then
+      print("[" .. addonName .. "] Cannot move the stun button while in combat.")
+    elseif IsStunButtonLocked() then
+      print("[" .. addonName .. "] Stun button is locked. Uncheck \"Lock stun button position\" in options.")
+    else
+      self:StartMoving()
+    end
+  end)
+
+  btn:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    if not IsStunButtonLocked() then
+      SaveStunButtonPosition(self)
+    end
+  end)
+
+  btn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    if stunPendingMessage then
+      GameTooltip:AddLine("Click to say the queued stun message in /say.")
+      GameTooltip:AddLine("SAY needs a click outdoors on Forever.", 0.7, 0.7, 0.7, true)
+      GameTooltip:AddLine("Hides when the stun ends.", 0.7, 0.7, 0.7, true)
+    else
+      GameTooltip:AddLine("Drag to move the stun button.")
+      GameTooltip:AddLine("It appears here when you are stunned.", 0.7, 0.7, 0.7, true)
+    end
+    if IsStunButtonLocked() then
+      GameTooltip:AddLine("Locked. Uncheck \"Lock stun button position\" in options to drag.", 0.7, 0.7, 0.7, true)
+    else
+      GameTooltip:AddLine("Unlocked. Drag to move; check the option again to lock.", 0.7, 0.7, 0.7, true)
+    end
+    GameTooltip:Show()
+  end)
+
+  btn:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+  end)
+
+  ApplyStunButtonPosition(btn)
+  btn:Hide()
+  stunButton = btn
+  return btn
+end
+
+local function ShowStunButton(text)
+  local btn = GetOrCreateStunButton()
+  if not btn then
+    return
+  end
+  btn.DSWF_Text:SetText(text)
+  btn:Show()
+end
+
+local function HideStunButton()
+  if stunButton then
+    stunButton:Hide()
+  end
+end
+
+local function ClearPendingStun()
+  stunPendingMessage = nil
+  stunPendingUntil = 0
+  if IsStunButtonLocked() then
+    HideStunButton()
+  else
+    ShowStunButton("Drag to move")
+  end
+end
+
+-- When unlocked, the button stays visible as a positioning handle even with no
+-- stun queued, so the player can actually drag it into place.
+function UpdateStunButton()
+  if not ns.db or ns.db.announceStun ~= true then
+    stunPendingMessage = nil
+    stunPendingUntil = 0
+    HideStunButton()
+    return
+  end
+  if stunPendingMessage then
+    ShowStunButton(stunPendingMessage)
+    return
+  end
+  if not IsStunButtonLocked() then
+    ShowStunButton("Drag to move")
+  else
+    HideStunButton()
+  end
+end
+
+-- SAY needs a hardware event outdoors but not inside instances. When we are
+-- in an instance we can send straight from the event handler; otherwise the
+-- player has to click the button to provide the hardware event.
+local function CanAutoSay()
+  if type(IsInInstance) ~= "function" then
+    return false
+  end
+  local ok, inside = pcall(IsInInstance)
+  if not ok or IsSecret(inside) then
+    return false
+  end
+  return inside == true
+end
+
+local function QueueStunMessage(message)
+  if CanAutoSay() then
+    local ok, err = SendSay(message)
+    StunTrace("auto say ok=" .. SafeText(ok) .. " err=" .. SafeText(err)
+      .. " msg=" .. SafeText(message))
+    ClearPendingStun()
+    return
+  end
+
+  stunPendingMessage = message
+  stunPendingUntil = GetTime() + STUN_BUTTON_TIMEOUT
+  UpdateStunButton()
+end
+
+-- When the loss-of-control data is secret (notably during combat), the typed
+-- stun and its duration cannot be read. These events still fire without a
+-- secret payload, so use them as a last resort and offer a generic message.
+local function QueueGenericStun(reason)
   if not ns.db or ns.db.announceStun ~= true then
     return
+  end
+  if stunLastKey == "generic" or stunPendingMessage then
+    return
+  end
+  stunLastKey = "generic"
+  StunTrace(reason .. " generic queued (LoC data unreadable)")
+  QueueStunMessage("Stunned")
+end
+
+local function TraceLocEntries(reason)
+  local count = GetLocCount()
+  StunTrace(reason .. " count=" .. SafeText(count))
+  for i = 1, count do
+    local entry = GetLocEntry(i)
+    if entry then
+      StunTrace(reason .. " #" .. i
+        .. " loc=" .. SafeText(entry.locType)
+        .. " spell=" .. SafeText(entry.spellID)
+        .. " start=" .. SafeText(entry.startTime)
+        .. " remain=" .. SafeText(entry.timeRemaining)
+        .. " dur=" .. SafeText(entry.duration))
+    else
+      StunTrace(reason .. " #" .. i .. " unreadable")
+    end
+  end
+end
+
+-- Diagnostic only: records the player's harmful auras so a stun that the
+-- loss-of-control API does not report can still be identified afterwards.
+local function ReadAuraField(aura, key)
+  local ok, value = pcall(function()
+    return aura[key]
+  end)
+  if not ok or IsSecret(value) then
+    return nil
+  end
+  return value
+end
+
+local function DescribeAura(aura)
+  local duration = ReadAuraField(aura, "duration")
+  local expiration = ReadAuraField(aura, "expirationTime")
+  local remaining
+  if type(duration) == "number" and type(expiration) == "number" then
+    remaining = expiration - GetTime()
+  end
+  local spellID = ReadAuraField(aura, "spellId") or ReadAuraField(aura, "spellID")
+  return SafeText(ReadAuraField(aura, "name"))
+    .. " id=" .. SafeText(spellID)
+    .. " type=" .. SafeText(ReadAuraField(aura, "debuffType"))
+    .. " remain=" .. SafeText(remaining)
+end
+
+local auraTraceAt = 0
+local function TracePlayerAuras(reason)
+  if not ns.db then
+    return
+  end
+  local now = GetTime()
+  if now - auraTraceAt < 0.5 then
+    return
+  end
+  auraTraceAt = now
+
+  local parts = {}
+  local method = "none"
+  local C = C_UnitAuras
+  if C and type(C.GetUnitAuras) == "function" then
+    local ok, list = pcall(C.GetUnitAuras, "player", "HARMFUL")
+    if ok and type(list) == "table" then
+      method = "GetUnitAuras"
+      for i = 1, #list do
+        parts[#parts + 1] = DescribeAura(list[i])
+      end
+    end
+  elseif C and type(C.GetAuraDataByIndex) == "function" then
+    method = "GetAuraDataByIndex"
+    for i = 1, 40 do
+      local ok, aura = pcall(C.GetAuraDataByIndex, "player", i, "HARMFUL")
+      if not ok or type(aura) ~= "table" then
+        break
+      end
+      parts[#parts + 1] = DescribeAura(aura)
+    end
+  elseif type(UnitAura) == "function" then
+    method = "UnitAura"
+    for i = 1, 40 do
+      local ok, name, _, count, debuffType, duration, expiration, _, _, _, spellID =
+        pcall(UnitAura, "player", i, "HARMFUL")
+      if not ok or name == nil then
+        break
+      end
+      parts[#parts + 1] = DescribeAura({
+        name = name, count = count, debuffType = debuffType,
+        duration = duration, expirationTime = expiration, spellId = spellID,
+      })
+    end
+  end
+
+  local log = ns.db.auraLog
+  if type(log) ~= "table" then
+    log = {}
+    ns.db.auraLog = log
+  end
+  log[#log + 1] = SafeText(now) .. "s " .. reason .. " via=" .. method
+    .. " n=" .. #parts .. " [" .. table.concat(parts, " | ") .. "]"
+  while #log > 8 do
+    table.remove(log, 1)
+  end
+end
+
+-- Announces at most one message per stun. Any of the events below can call
+-- this, so a client that does not fire one of them still announces via another.
+local function TryAnnounceStun(reason)
+  if not ns.db or ns.db.announceStun ~= true then
+    return false
   end
 
   local stun = GetActiveStun()
   if not stun then
-    stunLastKey = nil
-    return
+    return false
   end
   if stun.key == stunLastKey then
-    return
+    return false
   end
 
   stunLastKey = stun.key
-  StunDebug("announcing remain=" .. SafeText(stun.remaining) .. " key=" .. stun.key)
-  SayStun(stun.remaining)
+  local message = BuildStunMessage(stun.remaining)
+  StunTrace((reason or "?") .. " queued remain=" .. SafeText(stun.remaining)
+    .. " key=" .. stun.key .. " msg=" .. SafeText(message))
+  QueueStunMessage(message)
+  return true
+end
+
+-- A client that does not send the loss-of-control events to us still shows its
+-- own stun banner; use that as one more trigger.
+local function HookLossOfControlFrame()
+  local locFrame = _G.LossOfControlFrame
+  if not locFrame or locFrame.DSWF_StunHooked then
+    return
+  end
+  locFrame.DSWF_StunHooked = true
+  locFrame:HookScript("OnShow", function()
+    StunTrace("LOC_FRAME shown")
+    if not TryAnnounceStun("LOC_FRAME") then
+      QueueGenericStun("LOC_FRAME")
+    end
+  end)
+  locFrame:HookScript("OnHide", function()
+    stunLastKey = nil
+  end)
 end
 
 function ns.PrintStunStatus()
@@ -596,6 +980,7 @@ function ns.PrintStunStatus()
   end
 
   print("[" .. addonName .. "] announceStun=" .. SafeText(db.announceStun)
+    .. " stunButtonLocked=" .. SafeText(db.stunButtonLocked)
     .. " lossOfControlApi=" .. SafeText(type(C_LossOfControl) == "table")
     .. " count=" .. SafeText(GetLocCount())
     .. " events=" .. SafeText(stunEventsOk)
@@ -613,6 +998,24 @@ function ns.PrintStunStatus()
         SafeText(entry.timeRemaining), SafeText(entry.duration)))
     else
       print("[" .. addonName .. "] #" .. i .. " unreadable (secret or no data)")
+    end
+  end
+
+  local log = db.stunLog
+  if type(log) == "table" and #log > 0 then
+    print("[" .. addonName .. "] last stun events (" .. #log .. "):")
+    for i = 1, #log do
+      print("[" .. addonName .. "]   " .. SafeText(log[i]))
+    end
+  else
+    print("[" .. addonName .. "] no stun events recorded yet")
+  end
+
+  local auraLog = db.auraLog
+  if type(auraLog) == "table" and #auraLog > 0 then
+    print("[" .. addonName .. "] last harmful auras (" .. #auraLog .. "):")
+    for i = 1, #auraLog do
+      print("[" .. addonName .. "]   " .. SafeText(auraLog[i]))
     end
   end
 end
@@ -891,6 +1294,7 @@ function ns.ApplyOptions()
   end
 
   ns.UpdateThornsIcon()
+  UpdateStunButton()
 
   if InCombatLockdown() then
     ns.pendingRefresh = true
@@ -926,6 +1330,19 @@ local function AddCheckbox(category, variable, dbKey, label, tooltip, defaultVal
   return setting
 end
 
+-- Uses the same plain checkbox API as the other options. Custom initializer
+-- types taint the Settings panel on Forever and block /ds from opening it.
+local function AddStunCheckboxWithLock(category)
+  AddCheckbox(category, "DSWF_ANNOUNCE_STUN", "announceStun",
+    "Announce stuns in /say",
+    "Says \"Stunned (Xs)\" in /say automatically inside instances. Outdoors, shows a click button because SAY needs a hardware event there; the button hides when the stun ends.")
+
+  AddCheckbox(category, "DSWF_STUN_LOCK", "stunButtonLocked",
+    "Lock stun button position",
+    "Checked: the stun button cannot be dragged. Uncheck it to move the button, then check it again to lock the new position.",
+    true)
+end
+
 local function CreateOptions()
   if ns.optionsCategory or type(Settings) ~= "table" then
     return
@@ -953,9 +1370,7 @@ local function CreateOptions()
     "Replace XP bar with percentage",
     "Hides the XP bar and shows your current level progress and rested XP as percentages.",
     true)
-  AddCheckbox(category, "DSWF_ANNOUNCE_STUN", "announceStun",
-    "Announce stuns in /say",
-    "Says \"Stunned (Xs)\" in /say when you are stunned. X is the remaining stun duration in seconds. May be blocked on maps where the client restricts addon chat (dungeons/raids).")
+  AddStunCheckboxWithLock(category)
 
   local druidCategory = category
   if type(Settings.RegisterVerticalLayoutSubcategory) == "function" then
@@ -972,8 +1387,28 @@ local function CreateOptions()
   Settings.RegisterAddOnCategory(category)
 end
 
+local pendingOptionsOpen = false
+
 function ns.OpenOptions()
-  CreateOptions()
+  if InCombatLockdown() then
+    if not pendingOptionsOpen then
+      pendingOptionsOpen = true
+      print("[" .. addonName .. "] Options will open when combat ends.")
+      local waiter = CreateFrame("Frame")
+      waiter:RegisterEvent("PLAYER_REGEN_ENABLED")
+      waiter:SetScript("OnEvent", function(self)
+        self:UnregisterAllEvents()
+        self:SetScript("OnEvent", nil)
+        pendingOptionsOpen = false
+        ns.OpenOptions()
+      end)
+    end
+    return false
+  end
+  local ok, err = pcall(CreateOptions)
+  if not ok then
+    print("[" .. addonName .. "] options error: " .. tostring(err))
+  end
   if ns.optionsCategory then
     Settings.OpenToCategory(ns.optionsCategory:GetID())
     return true
@@ -998,7 +1433,7 @@ function frame:ADDON_LOADED(loaded)
     return
   end
   InitDB()
-  CreateOptions()
+  pcall(CreateOptions)
   self:UnregisterEvent("ADDON_LOADED")
 end
 
@@ -1008,10 +1443,16 @@ function frame:PLAYER_LOGIN()
   print("|cffd4a85a[" .. addonName .. "]|r online (" .. tag .. "), " .. SafePlayerName() .. ". Session " .. ns.db.seen .. ". /ds")
   HookEditMode()
   ns.ApplyOptions()
+  HookLossOfControlFrame()
+  GetOrCreateStunButton()
+  UpdateStunButton()
 end
 
 function frame:PLAYER_ENTERING_WORLD()
   ns.ApplyOptions()
+  HookLossOfControlFrame()
+  GetOrCreateStunButton()
+  UpdateStunButton()
 end
 
 function frame:PLAYER_XP_UPDATE()
@@ -1044,6 +1485,7 @@ end
 
 function frame:PLAYER_REGEN_ENABLED()
   ns.UpdateThornsIcon()
+  UpdateStunButton()
   if ns.pendingRefresh then
     Refresh()
   end
@@ -1087,7 +1529,10 @@ function frame:UNIT_AURA(unit)
   -- A stun also fires UNIT_AURA, so it doubles as a fallback trigger when the
   -- loss-of-control events are not fired by the client.
   if type(unit) ~= "string" or IsSecret(unit) or unit == "player" then
-    TryAnnounceStun()
+    if ns.db and ns.db.announceStun == true then
+      TracePlayerAuras("UNIT_AURA")
+    end
+    TryAnnounceStun("UNIT_AURA")
   end
 
   if not ns.thornsTank then
@@ -1100,36 +1545,75 @@ function frame:UNIT_AURA(unit)
 end
 
 function frame:LOSS_OF_CONTROL_ADDED(unit, effectIndex)
-  StunDebug("LOC_ADDED unit=" .. SafeText(unit) .. " index=" .. SafeText(effectIndex)
-    .. " count=" .. SafeText(GetLocCount()))
+  TraceLocEntries("LOC_ADDED unit=" .. SafeText(unit) .. " index=" .. SafeText(effectIndex))
   if stunDebug then
     ns.PrintStunStatus()
   end
-  TryAnnounceStun()
+  local isPlayer = (type(unit) == "string" and not IsSecret(unit) and unit == "player")
+  if isPlayer and not TryAnnounceStun("LOC_ADDED") then
+    QueueGenericStun("LOC_ADDED")
+  end
 end
 
 function frame:LOSS_OF_CONTROL_UPDATE(unit)
-  StunDebug("LOC_UPDATE unit=" .. SafeText(unit) .. " count=" .. SafeText(GetLocCount()))
-  TryAnnounceStun()
+  TraceLocEntries("LOC_UPDATE unit=" .. SafeText(unit))
+  if GetLocCount() == 0 then
+    ClearPendingStun()
+    return
+  end
+  if not TryAnnounceStun("LOC_UPDATE") then
+    QueueGenericStun("LOC_UPDATE")
+  end
 end
 
 function frame:PLAYER_CONTROL_LOST()
-  StunDebug("PLAYER_CONTROL_LOST count=" .. SafeText(GetLocCount()))
+  TraceLocEntries("CONTROL_LOST")
+  if ns.db and ns.db.announceStun == true then
+    TracePlayerAuras("CONTROL_LOST")
+  end
   if stunDebug then
     ns.PrintStunStatus()
   end
-  TryAnnounceStun()
+  if not TryAnnounceStun("CONTROL_LOST") and GetLocCount() > 0 then
+    QueueGenericStun("CONTROL_LOST")
+  end
 end
 
 function frame:PLAYER_CONTROL_GAINED()
-  StunDebug("PLAYER_CONTROL_GAINED")
+  StunTrace("CONTROL_GAINED")
   stunLastKey = nil
+  ClearPendingStun()
 end
 
 frame:SetScript("OnEvent", function(self, event, ...)
   local handler = self[event]
   if type(handler) == "function" then
     handler(self, ...)
+  end
+end)
+
+-- Some clients do not fire the loss-of-control events at all. A cheap poll is
+-- the last-resort trigger: it only runs while the option is enabled and only
+-- announces once per stun thanks to the start-time key.
+local stunPollElapsed = 0
+frame:SetScript("OnUpdate", function(_, elapsed)
+  if not ns.db or ns.db.announceStun ~= true then
+    return
+  end
+  stunPollElapsed = stunPollElapsed + (elapsed or 0)
+  if stunPollElapsed < 0.2 then
+    return
+  end
+  stunPollElapsed = 0
+  if stunPendingMessage and GetLocCount() == 0 then
+    StunTrace("loc cleared")
+    ClearPendingStun()
+    return
+  end
+  TryAnnounceStun("POLL")
+  if stunPendingMessage and GetTime() > stunPendingUntil then
+    StunTrace("pending expired")
+    ClearPendingStun()
   end
 end)
 
@@ -1183,6 +1667,7 @@ SlashCmdList["DSWOWFOREVER"] = function(msg)
       .. " hideObjectives=" .. tostring(ns.db and ns.db.hideObjectives)
       .. " showXPPercent=" .. tostring(ns.db and ns.db.showXPPercent)
       .. " announceStun=" .. tostring(ns.db and ns.db.announceStun)
+      .. " stunButtonLocked=" .. tostring(ns.db and ns.db.stunButtonLocked)
       .. " trackThornsOnTank=" .. tostring(ns.db and ns.db.trackThornsOnTank)
       .. " xpPercent=" .. tostring(GetXPPercent()))
     Refresh()
@@ -1192,9 +1677,23 @@ SlashCmdList["DSWOWFOREVER"] = function(msg)
     stunDebug = not stunDebug
     print("[" .. addonName .. "] stun debug " .. (stunDebug and "on" or "off"))
   elseif msg == "stun test" then
-    SayStun(2)
-    print("[" .. addonName .. "] sent a test announcement.")
+    local ok, err = SayStun(2)
+    print("[" .. addonName .. "] stun test: ok=" .. SafeText(ok) .. " err=" .. SafeText(err))
+  elseif msg == "stun button" then
+    QueueStunMessage(BuildStunMessage(2))
+    print("[" .. addonName .. "] stun button queued for testing")
+  elseif msg == "stun lock" then
+    if ns.db then
+      ns.db.stunButtonLocked = not IsStunButtonLocked()
+      UpdateStunButton()
+      print("[" .. addonName .. "] stun button " .. (IsStunButtonLocked() and "locked" or "unlocked"))
+    end
+  elseif msg == "stun clear" then
+    if ns.db then
+      ns.db.stunLog = {}
+    end
+    print("[" .. addonName .. "] stun log cleared")
   else
-    print("[" .. addonName .. "] usage: /ds (opens options), /ds status, /ds stun")
+    print("[" .. addonName .. "] usage: /ds (opens options), /ds status, /ds stun, /ds stun test, /ds stun button, /ds stun lock, /ds stun debug, /ds stun clear")
   end
 end
