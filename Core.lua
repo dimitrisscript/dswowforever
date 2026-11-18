@@ -1330,17 +1330,75 @@ local function AddCheckbox(category, variable, dbKey, label, tooltip, defaultVal
   return setting
 end
 
--- Uses the same plain checkbox API as the other options. Custom initializer
--- types taint the Settings panel on Forever and block /ds from opening it.
+-- Puts the lock control on the same row as the announce checkbox when the
+-- client supports the combined control. Falls back to two plain checkboxes.
 local function AddStunCheckboxWithLock(category)
-  AddCheckbox(category, "DSWF_ANNOUNCE_STUN", "announceStun",
-    "Announce stuns in /say",
-    "Says \"Stunned (Xs)\" in /say automatically inside instances. Outdoors, shows a click button because SAY needs a hardware event there; the button hides when the stun ends.")
+  local variable = "DSWF_ANNOUNCE_STUN"
+  local label = "Announce stuns in /say"
+  local tooltip = "Says \"Stunned (Xs)\" in /say automatically inside instances. "
+    .. "Outdoors, shows a click button because SAY needs a hardware event there; "
+    .. "the button hides when the stun ends."
+  local setting = Settings.RegisterProxySetting(
+    category,
+    variable,
+    Settings.VarType.Boolean,
+    label,
+    false,
+    function()
+      return ns.db.announceStun == true
+    end,
+    function(value)
+      ns.db.announceStun = value == true
+      ns.ApplyOptions()
+    end
+  )
 
-  AddCheckbox(category, "DSWF_STUN_LOCK", "stunButtonLocked",
-    "Lock stun button position",
-    "Checked: the stun button cannot be dragged. Uncheck it to move the button, then check it again to lock the new position.",
-    true)
+  local combined = false
+  if type(CreateSettingsCheckboxWithButtonInitializer) == "function"
+    and type(Settings.RegisterInitializer) == "function" then
+    local function LockButtonText()
+      return IsStunButtonLocked() and "Locked" or "Unlocked"
+    end
+
+    local function OnLockButtonClick()
+      if not ns.db then
+        return
+      end
+      ns.db.stunButtonLocked = not IsStunButtonLocked()
+      UpdateStunButton()
+      pcall(Settings.NotifyUpdate, variable)
+    end
+
+    local function EvaluateLockButton(control)
+      if not control or not control.Button then
+        return
+      end
+      control.Button.tooltipText = IsStunButtonLocked()
+        and "Stun button is locked. Click to unlock and allow dragging."
+        or "Stun button is unlocked. Drag it to move, then click to lock."
+    end
+
+    local created, initializer = pcall(
+      CreateSettingsCheckboxWithButtonInitializer,
+      setting,
+      LockButtonText,
+      OnLockButtonClick,
+      EvaluateLockButton,
+      false,
+      tooltip
+    )
+    if created and initializer then
+      combined = pcall(Settings.RegisterInitializer, category, initializer)
+    end
+  end
+
+  if not combined then
+    Settings.CreateCheckbox(category, setting, tooltip)
+    AddCheckbox(category, "DSWF_STUN_LOCK", "stunButtonLocked",
+      "Lock stun button position",
+      "Checked: the stun button cannot be dragged. Uncheck it to move the button, then check it again to lock the new position.",
+      true)
+  end
 end
 
 local function CreateOptions()
