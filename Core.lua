@@ -50,6 +50,9 @@ local function InitDB()
   if type(db.hideObjectives) ~= "boolean" then
     db.hideObjectives = false
   end
+  if type(db.hideStanceBar) ~= "boolean" then
+    db.hideStanceBar = false
+  end
   if type(db.showXPPercent) ~= "boolean" then
     db.showXPPercent = true
   end
@@ -118,6 +121,71 @@ local function GetObjectivesTracker()
     end)
   end
   return tracker
+end
+
+-- Stance bar -----------------------------------------------------------
+-- The class bar (stances, shapeshift forms, stealth, auras) re-shows itself
+-- whenever the player changes forms, so hook OnShow to hide it again while
+-- the option is enabled. Name differs across clients, so fall back to the
+-- parent of the first stance button.
+local function IsStanceBarFrame(frame)
+  return frame
+    and type(frame.Hide) == "function"
+    and type(frame.IsShown) == "function"
+end
+
+local function GetStanceBar()
+  local bar = _G.StanceBar or _G.StanceBarFrame or _G.StanceBarMorph
+  if not IsStanceBarFrame(bar) then
+    bar = nil
+    local button = _G.StanceButton1
+    if button and type(button.GetParent) == "function" then
+      local ok, parent = pcall(button.GetParent, button)
+      if ok and IsStanceBarFrame(parent) then
+        bar = parent
+      end
+    end
+  end
+
+  if bar and type(bar.HookScript) == "function" and not bar.DSWF_StanceHooked then
+    bar.DSWF_StanceHooked = true
+    bar:HookScript("OnShow", function(self)
+      if ns.db and ns.db.hideStanceBar then
+        if type(InCombatLockdown) == "function" and InCombatLockdown() then
+          -- Cannot reliably hide a secure bar during lockdown; retry when it ends.
+          ns.pendingRefresh = true
+        else
+          SetFrameShown(self, false)
+        end
+      end
+    end)
+  end
+  return bar
+end
+
+local function ApplyStanceBarOption()
+  local bar = GetStanceBar()
+  if not bar then
+    return
+  end
+
+  if not ns.db or not ns.db.hideStanceBar then
+    -- Let the client restore its own visibility so an empty bar is not forced
+    -- on classes without stances.
+    if type(_G.StanceBar_UpdateState) == "function" then
+      pcall(_G.StanceBar_UpdateState)
+    elseif type(GetNumShapeshiftForms) == "function" then
+      local ok, count = pcall(GetNumShapeshiftForms)
+      if ok and type(count) == "number" and not IsSecret(count) then
+        SetFrameShown(bar, count > 0)
+      end
+    else
+      SetFrameShown(bar, true)
+    end
+    return
+  end
+
+  SetFrameShown(bar, false)
 end
 
 -- XP bar ---------------------------------------------------------------
@@ -469,6 +537,8 @@ end
 
 -- Returns a plain copy of one loss-of-control entry, or nil when it cannot be
 -- read (missing, forbidden, or secret while loss-of-control info is restricted).
+-- The returned table can be secret as a whole while individual fields stay
+-- readable, so each field is read on its own instead of rejecting the table.
 local function GetLocEntry(index)
   if type(C_LossOfControl) ~= "table" then
     return nil
@@ -478,13 +548,30 @@ local function GetLocEntry(index)
     return nil
   end
   local ok, data = pcall(getter, index)
-  if not ok or type(data) ~= "table" or IsSecret(data) then
+  if not ok or type(data) ~= "table" then
     return nil
   end
 
-  local locType = ReadLocField(data, "locType")
-  if type(locType) ~= "string" then
+  local okType, locType = pcall(function()
+    return data.locType
+  end)
+  if not okType or type(locType) ~= "string" then
     return nil
+  end
+
+  -- locType may still be a secret string. Comparing it to a constant is
+  -- normally blocked for tainted code, so the result is only trusted when the
+  -- client lets the comparison through and returns a non-secret boolean.
+  local isStun
+  if not IsSecret(locType) then
+    isStun = (locType == STUN_LOC_TYPE)
+  else
+    local okCmp, result = pcall(function()
+      return locType == STUN_LOC_TYPE
+    end)
+    if okCmp and type(result) == "boolean" and not IsSecret(result) then
+      isStun = result
+    end
   end
 
   local spellID = ReadLocField(data, "spellID")
@@ -494,6 +581,7 @@ local function GetLocEntry(index)
 
   return {
     locType = locType,
+    isStun = isStun,
     displayText = ReadLocField(data, "displayText"),
     spellID = type(spellID) == "number" and spellID or nil,
     startTime = type(startTime) == "number" and startTime or nil,
@@ -524,7 +612,7 @@ local function GetActiveStun()
   local best
   for i = 1, GetLocCount() do
     local entry = GetLocEntry(i)
-    if entry and entry.locType == STUN_LOC_TYPE then
+    if entry and entry.isStun == true then
       local remaining = EntryRemaining(entry)
       local key = SafeText(entry.spellID) .. ":" .. SafeText(entry.startTime)
       if not best or (remaining or 0) > (best.remaining or 0) then
@@ -533,6 +621,63 @@ local function GetActiveStun()
     end
   end
   return best
+end
+
+-- Classifies the visible loss-of-control entries: "stun" when a readable stun
+-- is present, "other" when every entry is readable and none is a stun, and
+-- "unknown" when the client keeps the entries secret.
+local function GetLocStunState()
+  local count = GetLocCount()
+  if count == 0 then
+    return "unknown"
+  end
+  local readable = 0
+  for i = 1, count do
+    local entry = GetLocEntry(i)
+    if entry and entry.isStun ~= nil then
+      readable = readable + 1
+      if entry.isStun then
+        return "stun"
+      end
+    end
+  end
+  if readable == count then
+    return "other"
+  end
+  return "unknown"
+end
+
+-- A stun (and the other full loss-of-control effects) puts the client's
+-- loss-of-control cooldown on the action buttons, while a root does not. Only
+-- the isActive field of that cooldown is readable when combat data is
+-- restricted, so use it to tell a stun apart from a root. Returns nil when the
+-- check cannot be made at all (no API or no actions on the bars).
+local function IsActionLossOfControlActive()
+  local getter
+  if type(C_ActionBar) == "table" then
+    getter = C_ActionBar.GetActionLossOfControlCooldownInfo
+  end
+  if type(getter) ~= "function" then
+    getter = _G.GetActionLossOfControlCooldownInfo
+  end
+  if type(getter) ~= "function" then
+    return nil
+  end
+
+  local checked = 0
+  for slot = 1, 120 do
+    local ok, info = pcall(getter, slot)
+    if ok and type(info) == "table" then
+      checked = checked + 1
+      if ReadLocField(info, "isActive") == true then
+        return true
+      end
+    end
+  end
+  if checked == 0 then
+    return nil
+  end
+  return false
 end
 
 local function FormatStunSeconds(seconds)
@@ -802,15 +947,47 @@ end
 -- When the loss-of-control data is secret (notably during combat), the typed
 -- stun and its duration cannot be read. These events still fire without a
 -- secret payload, so use them as a last resort and offer a generic message.
-local function QueueGenericStun(reason)
+-- The action-button loss-of-control cooldown tells a real stun apart from a
+-- root even then; without it a root would be announced as a stun.
+local stunGenericRetryAt = 0
+local stunGenericRetryReason = nil
+
+local function QueueGenericStun(reason, isRetry)
   if not ns.db or ns.db.announceStun ~= true then
     return
   end
   if stunLastKey == "generic" or stunPendingMessage then
     return
   end
+
+  local state = GetLocStunState()
+  if state == "stun" then
+    return
+  end
+  if state == "other" then
+    StunDebug(reason .. " generic skipped: readable non-stun loss of control")
+    return
+  end
+
+  local actionLoc = IsActionLossOfControlActive()
+  if actionLoc == false then
+    if isRetry then
+      StunDebug(reason .. " generic skipped: no action loss of control (root)")
+      return
+    end
+    -- The action-button cooldown can be applied a moment after the event.
+    if stunGenericRetryAt == 0 then
+      stunGenericRetryAt = GetTime() + 0.3
+      stunGenericRetryReason = reason
+      StunDebug(reason .. " generic deferred: action loss of control not active yet")
+    end
+    return
+  end
+
+  stunGenericRetryAt = 0
+  stunGenericRetryReason = nil
   stunLastKey = "generic"
-  StunTrace(reason .. " generic queued (LoC data unreadable)")
+  StunTrace(reason .. " generic queued (actionLoC=" .. SafeText(actionLoc) .. ")")
   QueueStunMessage("Stunned")
 end
 
@@ -955,6 +1132,8 @@ local function HookLossOfControlFrame()
   end)
   locFrame:HookScript("OnHide", function()
     stunLastKey = nil
+    stunGenericRetryAt = 0
+    stunGenericRetryReason = nil
   end)
 end
 
@@ -982,6 +1161,8 @@ function ns.PrintStunStatus()
     .. " stunButtonLocked=" .. SafeText(db.stunButtonLocked)
     .. " lossOfControlApi=" .. SafeText(type(C_LossOfControl) == "table")
     .. " count=" .. SafeText(GetLocCount())
+    .. " locState=" .. SafeText(GetLocStunState())
+    .. " actionLoc=" .. SafeText(IsActionLossOfControlActive())
     .. " events=" .. SafeText(stunEventsOk)
     .. " debug=" .. SafeText(stunDebug)
     .. " inInstance=" .. SafeText(inInstance)
@@ -1388,6 +1569,7 @@ function ns.ApplyOptions()
   SetFrameShown(GetBagsBar(), not ns.db.hideBags)
   SetFrameShown(GetMiniMenu(), not ns.db.hideMiniMenu)
   SetFrameShown(GetObjectivesTracker(), not ns.db.hideObjectives)
+  ApplyStanceBarOption()
 end
 
 local function Refresh()
@@ -1420,7 +1602,7 @@ local function AddStunCheckboxWithLock(category)
   local label = "Announce stuns in /say"
   local tooltip = "Says \"Stunned (Xs)\" in /say automatically inside instances. "
     .. "Outdoors, shows a click button because SAY needs a hardware event there; "
-    .. "the button hides when the stun ends."
+    .. "the button hides when the stun ends. Roots are ignored."
   local setting = Settings.RegisterProxySetting(
     category,
     variable,
@@ -1578,6 +1760,9 @@ local function CreateOptions()
   AddCheckbox(category, "DSWF_HIDE_OBJECTIVES", "hideObjectives",
     "Hide objectives tracker",
     "Hides the quest and objective tracker on the right side of the screen.")
+  AddCheckbox(category, "DSWF_HIDE_STANCE_BAR", "hideStanceBar",
+    "Hide stance bar",
+    "Hides the class bar that shows stances, shapeshift forms, stealth, and auras.")
   AddCheckbox(category, "DSWF_XP_PERCENT", "showXPPercent",
     "Replace XP bar with percentage",
     "Hides the XP bar and shows your current level progress and rested XP as percentages.",
@@ -1792,6 +1977,8 @@ end
 function frame:PLAYER_CONTROL_GAINED()
   StunTrace("CONTROL_GAINED")
   stunLastKey = nil
+  stunGenericRetryAt = 0
+  stunGenericRetryReason = nil
   ClearPendingStun()
 end
 
@@ -1815,10 +2002,23 @@ frame:SetScript("OnUpdate", function(_, elapsed)
     return
   end
   stunPollElapsed = 0
-  if stunPendingMessage and GetLocCount() == 0 then
-    StunTrace("loc cleared")
-    ClearPendingStun()
+  if GetLocCount() == 0 then
+    if stunPendingMessage then
+      StunTrace("loc cleared")
+      ClearPendingStun()
+    end
+    stunLastKey = nil
+    stunGenericRetryAt = 0
+    stunGenericRetryReason = nil
     return
+  end
+  if stunGenericRetryAt > 0 and GetTime() >= stunGenericRetryAt then
+    local reason = stunGenericRetryReason or "POLL"
+    stunGenericRetryAt = 0
+    stunGenericRetryReason = nil
+    if GetLocCount() > 0 then
+      QueueGenericStun(reason, true)
+    end
   end
   TryAnnounceStun("POLL")
   if stunPendingMessage and GetTime() > stunPendingUntil then
@@ -1875,6 +2075,7 @@ SlashCmdList["DSWOWFOREVER"] = function(msg)
       .. " hideBags=" .. tostring(ns.db and ns.db.hideBags)
       .. " hideMiniMenu=" .. tostring(ns.db and ns.db.hideMiniMenu)
       .. " hideObjectives=" .. tostring(ns.db and ns.db.hideObjectives)
+      .. " hideStanceBar=" .. tostring(ns.db and ns.db.hideStanceBar)
       .. " showXPPercent=" .. tostring(ns.db and ns.db.showXPPercent)
       .. " announceStun=" .. tostring(ns.db and ns.db.announceStun)
       .. " stunButtonLocked=" .. tostring(ns.db and ns.db.stunButtonLocked)
